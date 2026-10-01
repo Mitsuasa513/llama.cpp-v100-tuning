@@ -16,7 +16,13 @@
 8.8 万 token 提示词的端到端结果：
 
 
-<img src="IMAGES/zh-cn.png" alt="V100 内核调优：解码与预填充的前后对比" width="900">
+<img src="IMAGES/zh0.png" alt="优化前 vs 优化后，未开 MTP" width="900">
+
+*优化前 / 优化后，未开 MTP。每根柱子都是同卡、同模型的 llama-bench 实测。*
+
+<img src="IMAGES/zh-cn.png" alt="完整优化 + MTP：各深度下的预填充与解码" width="900">
+
+*同一个构建再开 MTP draft=3：各上下文深度下的绝对速度。*
 
 预填充再加上 `-b 4096 -ub 4096`，90K 深度从 501 提到 **726 t/s**（见下）。
 
@@ -83,7 +89,13 @@ Measured with `llama-bench` on one V100 32G running **Qwen3.8-27B Q4_K_M**
 (48 SSM + 16 full-attention layers), `-fa on`, q8_0 KV; decode is `tg128`, prefill is
 `pp512`. The MTP row is a real end-to-end 88K-token prompt:
 
-<img src="IMAGES/en.png" alt="V100 kernel tuning: decode and prefill, before vs after" width="900">
+<img src="IMAGES/en0.png" alt="Upstream vs this branch, MTP off" width="900">
+
+*Before / after, MTP off. Every bar is a llama-bench measurement on the same card and model.*
+
+<img src="IMAGES/en.png" alt="Fully tuned build with MTP: prefill and decode by context depth" width="900">
+
+*The same build with MTP draft=3: absolute speed at each context depth.*  
 
 
 Prefill with `-b 4096 -ub 4096` reaches **726 t/s** at 90K depth, against 501 with the
