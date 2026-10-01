@@ -1,4 +1,4 @@
-# V100 (sm_70) 内核调校 for llama.cpp 😊 (FOR ENGLISH VER PLEASE SCROLL DOWN😊)
+# V100 (sm_70) 美丽单卡内核调校 for llama.cpp 😊 (FOR ENGLISH VER PLEASE SCROLL DOWN😊)
 
 > **长上下文解码：90K 快 24%，262K 快 52%；预填充快 36~57%。**
 > 同一张卡、同一个模型，上游 vs 本分支。
@@ -71,7 +71,7 @@ cmake --build build --config Release -j
 * 分支基于上游提交 `df03399b`（其 CUDA 源码与本次开发和实测所用的源码逐字节一致）。
   改动量：**11 个文件，+930 / −86**。
 
-# V100 (sm_70) kernel tuning for llama.cpp 😊
+# V100 (sm_70) beautiful single-card kernel tuning for llama.cpp 😊
 
 > **Long-context decode: +24% at 90K, +52% at 262K. Prefill: +36~57%.**
 > Same card, same model, upstream vs this branch.
