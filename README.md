@@ -15,7 +15,8 @@
 全注意力），`-fa on`，q8_0 KV；解码用 tg128，预填充用 pp512。MTP 那行是真实
 8.8 万 token 提示词的端到端结果：
 
-😊
+
+<img src="IMAGES/zh-cn.png" alt="V100 内核调优：解码与预填充的前后对比" width="900">
 
 预填充再加上 `-b 4096 -ub 4096`，90K 深度从 501 提到 **726 t/s**（见下）。
 
@@ -82,7 +83,7 @@ Measured with `llama-bench` on one V100 32G running **Qwen3.8-27B Q4_K_M**
 (48 SSM + 16 full-attention layers), `-fa on`, q8_0 KV; decode is `tg128`, prefill is
 `pp512`. The MTP row is a real end-to-end 88K-token prompt:
 
-😊
+<img src="IMAGES/en.png" alt="V100 kernel tuning: decode and prefill, before vs after" width="900">
 
 
 Prefill with `-b 4096 -ub 4096` reaches **726 t/s** at 90K depth, against 501 with the
