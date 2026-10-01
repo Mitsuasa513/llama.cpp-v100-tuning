@@ -111,6 +111,24 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
 }
 
 static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_config_volta(const int DKQ, const int DV, const int ncols) {
+    // EXPERIMENTAL (Codex, V100): prefill attention only reaches ~15% of the FP16 tensor core peak
+    // here. The kernel is compute bound (dispatch data shows ~2 GB/s of K/V traffic vs 900 GB/s
+    // available) and the Ampere config causes heavy register spilling on sm_70 (255 registers +
+    // 488 bytes of stack per thread). Keep Q in shared memory instead of registers to relieve that.
+    // nthreads/occupancy/nbatch_*/nstages are left at the Ampere values for now (single variable).
+    // EXPERIMENTAL (Codex, V100) 2nd pass: ncols=16/32 also spilled (255 regs + 432 B of stack per
+    // thread), so move Q to shared memory here as well.
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 16, 128, 2,  32, 128, 128, 128, 2, true);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 32, 128, 2,  32, 128, 128, 128, 2, true);
+    // ncu (sm_70, 90K prefill): achieved occupancy was 6.25% - shared memory limited the kernel to
+    // 1 block/SM (Q in shared ~33.8 KiB + K/V tile + mask ~55 KiB). Halving the K/V rows per
+    // iteration fits 2 blocks/SM.
+    // EXPERIMENTAL (Codex, V100) 3rd pass: ncu says this config is pinned to 1 block/SM by shared
+    // memory (67.58 KiB/block vs 98.3 KiB/SM). nbatch_fa cannot go below 32 (static_assert % 32),
+    // so halve the K/V load buffers instead to shrink the shared tile.
+    // 64 is the sweet spot: 32 measured 630.66 t/s vs 633.42 for 64 (pp512 @ d45056).
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 64, 128, 2,  32,  64,  64,  64, 2, false);
+
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512,  8,  64, 4,  32, 256, 256,  64, 1, false);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 16,  64, 4,  32, 256, 256,  64, 1, false);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 32, 128, 2,  32, 128, 128,  64, 1, false);

@@ -9,6 +9,9 @@
 // only enabled on DGX Spark, where it is a gain on every type below. On the higher-bandwidth parts the kernel
 // has little exposed latency left to hide and the extra requests cost more than they save.
 // For perf data, see https://github.com/ggml-org/llama.cpp/pull/26705#issuecomment-5569335031
+// EXPERIMENTAL (Codex, V100): tried enabling this on Volta as well (the profile shows the Q4_K matvec is
+// DRAM bound at ~75% with L1/L2/compute idle), but it measurably regressed (33.50 vs 34.23 t/s at d=0),
+// matching the comment above. Left disabled for Volta.
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK
 // returns true only for those quants that benefit from prefetch and false otherwise
 static constexpr __host__ __device__ bool mmvq_should_prefetch(ggml_type type) {
@@ -100,7 +103,8 @@ enum mmvq_parameter_table_id {
     MMVQ_PARAMETERS_RDNA2,
     MMVQ_PARAMETERS_RDNA3_0,
     MMVQ_PARAMETERS_RDNA4,
-    MMVQ_PARAMETERS_GB10
+    MMVQ_PARAMETERS_GB10,
+    MMVQ_PARAMETERS_VOLTA // EXPERIMENTAL (Codex, V100)
 };
 
 static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
@@ -116,6 +120,8 @@ static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
     return MMVQ_PARAMETERS_TURING;
 #elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK
     return MMVQ_PARAMETERS_GB10;
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_VOLTA
+    return MMVQ_PARAMETERS_VOLTA; // EXPERIMENTAL (Codex, V100)
 #else
     return MMVQ_PARAMETERS_GENERIC;
 #endif
@@ -139,6 +145,10 @@ static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
     }
     if (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_DGX_SPARK) {
         return MMVQ_PARAMETERS_GB10;
+    }
+    // EXPERIMENTAL (Codex, V100): give Volta its own MMVQ table instead of falling back to GENERIC.
+    if (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_VOLTA) {
+        return MMVQ_PARAMETERS_VOLTA;
     }
     return MMVQ_PARAMETERS_GENERIC;
 }
@@ -440,6 +450,23 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
             case 2:
             case 3:
             case 4:
+                return 4; // best measured value for batch-1 on V100 (2 and 8 were both slower)
+            case 5:
+            case 6:
+            case 7:
+            case 8:
+                return 2;
+            default:
+                return 1;
+        }
+    } else if (table_id == MMVQ_PARAMETERS_VOLTA) {
+        // EXPERIMENTAL (Codex, V100): warp count stays as in the GENERIC table for now; the
+        // difference is rows_per_block (see calc_rows_per_block).
+        switch (ncols_dst) {
+            case 1:
+            case 2:
+            case 3:
+            case 4:
                 return 4;
             case 5:
             case 6:
@@ -561,6 +588,25 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
 }
 
 static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
+    // EXPERIMENTAL (Codex, V100): Volta's dedicated table. The GENERIC table uses one output row per
+    // block, so every block pays for a cross warp reduction and a full re-read of the activation
+    // vector. Processing several rows per block amortizes both.
+    if (table_id == MMVQ_PARAMETERS_VOLTA) {
+        switch (ncols_dst) {
+            case 1:
+                return small_k ? nwarps : 2; // was 1 in the GENERIC table (1/2/4/8 measured: 2 wins)
+            case 2:
+            case 3:
+            case 4:
+            case 5:
+            case 6:
+            case 7:
+            case 8:
+                return 2;
+            default:
+                return 1;
+        }
+    }
     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
         switch (ncols_dst) {
             case 1:
@@ -580,7 +626,13 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
     return 1;
 }
 
-template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false>
+// EXPERIMENTAL (Codex, V100): same formula as op_softplus in unary.cu, so that the fused SSM
+// epilogue below stays bit-identical to the separate ADD + SOFTPLUS + MUL kernels.
+static __device__ __forceinline__ float ggml_v100_softplus(float x) {
+    return (x > 20.0f) ? x : logf(1.0f + expf(x));
+}
+
+template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false, int rows_override = 0>
 __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
@@ -599,7 +651,9 @@ static __global__ void mul_mat_vec_q(
     constexpr int vdr = get_vdr_mmvq(type);
     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
     constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
-    constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
+    // EXPERIMENTAL (Codex, V100): rows_override lets the host pick a different number of output rows per
+    // block depending on the matrix size (see ggml_cuda_mmvq_rows_override()).
+    constexpr int rows_per_cuda_block = rows_override > 0 ? rows_override : calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
@@ -636,6 +690,10 @@ static __global__ void mul_mat_vec_q(
     ggml_glu_op active_glu;
     float glu_limit = 0.0f;
 
+    // EXPERIMENTAL (Codex, V100): SSM alpha/beta epilogue (see ggml_cuda_mm_fusion_args_host).
+    [[maybe_unused]] const float * v100_ssm_a = nullptr;
+    [[maybe_unused]] int           v100_epilogue = 0;
+
     if constexpr (has_fusion) {
         use_gate      = fusion.gate      != nullptr;
         use_bias      = fusion.x_bias    != nullptr;
@@ -645,6 +703,8 @@ static __global__ void mul_mat_vec_q(
         gate_bias     = (const float *) fusion.gate_bias;
         active_glu    = fusion.glu_op;
         glu_limit     = fusion.glu_limit;
+        v100_ssm_a    = (const float *) fusion.ssm_a;
+        v100_epilogue = fusion.epilogue;
         if constexpr (type == GGML_TYPE_NVFP4) {
             use_scale      = fusion.x_scale    != nullptr;
             use_gate_scale = fusion.gate_scale != nullptr && use_gate;
@@ -656,6 +716,7 @@ static __global__ void mul_mat_vec_q(
 
     [[maybe_unused]] float x_biases[ncols_dst]    = { 0.0f };
     [[maybe_unused]] float gate_biases[ncols_dst] = { 0.0f };
+    [[maybe_unused]] float x_ssm_as[ncols_dst]    = { 0.0f };
     [[maybe_unused]] float x_scales = 1.0f;
     [[maybe_unused]] float gate_scales = 1.0f;
     if constexpr (has_fusion) {
@@ -676,6 +737,15 @@ static __global__ void mul_mat_vec_q(
 #pragma unroll
                 for (int j = 0; j < ncols_dst; ++j) {
                     gate_biases[j] = gate_bias[j * stride_col_dst + threadIdx.x];
+                }
+            }
+            // EXPERIMENTAL (Codex, V100): the multiplier of the SSM alpha epilogue is indexed
+            // exactly like a bias, so the same preload/die-check applies.
+            if (v100_epilogue == 1 && v100_ssm_a != nullptr) {
+                const float * ssm_a = v100_ssm_a + row0;
+#pragma unroll
+                for (int j = 0; j < ncols_dst; ++j) {
+                    x_ssm_as[j] = ssm_a[j * stride_col_dst + threadIdx.x];
                 }
             }
             if constexpr (type == GGML_TYPE_NVFP4) {
@@ -790,7 +860,13 @@ static __global__ void mul_mat_vec_q(
                         result *= x_scales;
                     }
                     result += x_biases[j];
-                    if (use_gate) {
+                    if (v100_epilogue == 1) {
+                        // matvec -> +bias -> softplus -> *ssm_a  (the SSM alpha/gate projection)
+                        result = ggml_v100_softplus(result) * x_ssm_as[j];
+                    } else if (v100_epilogue == 2) {
+                        // matvec -> sigmoid  (the SSM beta projection)
+                        result = 1.0f / (1.0f + expf(-result));
+                    } else if (use_gate) {
                         float gate_value = tmp_gate[j][i];
                         if constexpr (type == GGML_TYPE_NVFP4) {
                             gate_value *= gate_scales;
@@ -982,16 +1058,44 @@ static __global__ void mul_mat_vec_q_moe(
 template<ggml_type type>
 static std::pair<dim3, dim3> calc_launch_params(
         const int ncols_dst, const int nrows_x, const int nchannels_dst, const int nsamples_or_ntokens,
-        const int warp_size, const mmvq_parameter_table_id table_id, const bool small_k = false, const bool halve_iters = false) {
+        const int warp_size, const mmvq_parameter_table_id table_id, const bool small_k = false, const bool halve_iters = false,
+        const int rows_override = 0) {
     const int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
-    const int rpb = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
+    const int rpb = rows_override > 0 ? rows_override : calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
     const int64_t nblocks = (nrows_x + rpb - 1) / rpb;
     const dim3 block_nums(nblocks, nchannels_dst, nsamples_or_ntokens);
     const dim3 block_dims(warp_size, nwarps, 1);
     return {block_nums, block_dims};
 }
 
-template<ggml_type type, int c_ncols_dst, bool small_k = false, bool halve_iters = false>
+// EXPERIMENTAL (Codex, V100): pick rows_per_block by matrix size. A big matrix wants many rows per
+// block, because every block re-reads the whole activation vector from DRAM (an ncu profile shows
+// ~1/3 of the matvec's DRAM traffic is that re-read; the streamed weights evict it from L2). A small
+// matrix wants few rows per block, because otherwise there are too few blocks to fill the SMs.
+// GGML_V100_MMVQ_ROWS / GGML_V100_MMVQ_ROWS_MIN let one build sweep the pair.
+//
+// RESULT (2026-09-19): the hypothesis is wrong on this GPU. Every setting that actually raised
+// rows_per_block above the default 2 lost throughput: 28.6 t/s at ROWS_MIN=512..4096 and 29.2 at
+// 8192, against 34.16 for the default (d=0, tg128). The reason is register pressure: cuobjdump
+// -res-usage on the batch-1, no-fusion instantiation gives ~44-87 regs at rows=2, 45-128 at
+// rows=4 and 48-192 at rows=8, i.e. occupancy collapses from ~6 to ~2 blocks/SM. The kernel is
+// still worth keeping, but the default is now 0 = "no override", i.e. the tuned P1 behaviour.
+static int ggml_cuda_mmvq_rows_override(const int nrows_x) {
+    static const int rows = []() {
+        const char * env = getenv("GGML_V100_MMVQ_ROWS");
+        return env ? atoi(env) : 0;
+    }();
+    static const int min_rows = []() {
+        const char * env = getenv("GGML_V100_MMVQ_ROWS_MIN");
+        return env ? atoi(env) : 4096;
+    }();
+    if (rows <= 0 || min_rows <= 0 || nrows_x < min_rows) {
+        return 0;
+    }
+    return rows;
+}
+
+template<ggml_type type, int c_ncols_dst, bool small_k = false, bool halve_iters = false, int rows_override = 0>
 static void mul_mat_vec_q_switch_fusion(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
@@ -1006,7 +1110,7 @@ static void mul_mat_vec_q_switch_fusion(
     if constexpr (c_ncols_dst == 1) {
         if (has_fusion) {
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
-            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters>, launch_params,
+            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters, rows_override>, launch_params,
                  vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
@@ -1017,7 +1121,7 @@ static void mul_mat_vec_q_switch_fusion(
     GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
 
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
-    ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters>, launch_params,
+    ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters, rows_override>, launch_params,
         vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
         sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
@@ -1162,7 +1266,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
             static constexpr int c_ncols_dst = 1;
 
             // Tag types keep the flags compile-time, so __launch_bounds__ matches what is launched.
-            const auto launch = [&](auto small_k_tag, auto halve_iters_tag) {
+            const auto launch = [&](auto small_k_tag, auto halve_iters_tag, auto rows_tag) {
                 constexpr bool c_small_k = decltype(small_k_tag)::value;
                 // Types the table does not promote would compile a second, identical kernel.
                 constexpr bool c_promoted =
@@ -1170,10 +1274,11 @@ static void mul_mat_vec_q_switch_ncols_dst(
                     calc_nwarps(type, c_ncols_dst, MMVQ_PARAMETERS_GB10, false, false);
 
                 constexpr bool c_halve_iters = decltype(halve_iters_tag)::value && c_promoted;
+                constexpr int  c_rows        = decltype(rows_tag)::value;
 
                 const std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst,
-                                                                              nsamples_dst, warp_size, table_id, c_small_k, c_halve_iters);
-                mul_mat_vec_q_switch_fusion<type, c_ncols_dst, c_small_k, c_halve_iters>(
+                                                                              nsamples_dst, warp_size, table_id, c_small_k, c_halve_iters, c_rows);
+                mul_mat_vec_q_switch_fusion<type, c_ncols_dst, c_small_k, c_halve_iters, c_rows>(
                     vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                     channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
                     stride_sample_x, stride_sample_y, stride_sample_dst, dims.first, dims.second, 0, ids_stride,
@@ -1181,11 +1286,15 @@ static void mul_mat_vec_q_switch_ncols_dst(
             };
 
             if (should_use_small_k(c_ncols_dst)) {
-                launch(std::true_type{},  std::false_type{});
+                launch(std::true_type{},  std::false_type{}, std::integral_constant<int, 0>{});
             } else if (should_halve_iters()) {
-                launch(std::false_type{}, std::true_type{});
+                launch(std::false_type{}, std::true_type{},  std::integral_constant<int, 0>{});
+            } else if (ggml_cuda_mmvq_rows_override(nrows_x) == 8) {
+                launch(std::false_type{}, std::false_type{}, std::integral_constant<int, 8>{});
+            } else if (ggml_cuda_mmvq_rows_override(nrows_x) == 4) {
+                launch(std::false_type{}, std::false_type{}, std::integral_constant<int, 4>{});
             } else {
-                launch(std::false_type{}, std::false_type{});
+                launch(std::false_type{}, std::false_type{}, std::integral_constant<int, 0>{});
             }
         } break;
         case 2: {
@@ -1402,6 +1511,124 @@ static void mul_mat_vec_q_switch_type(
     }
 }
 
+// -----------------------------------------------------------------------------------------------
+// EXPERIMENTAL (Codex, V100): deduplicate the q8_1 quantization of activations.
+//
+// Every MMVQ node quantizes its own src1 into a scratch buffer, but in a hybrid model a single
+// activation is the src1 of several MUL_MAT nodes: the normed hidden state of an SSM layer feeds
+// the qkv, alpha, beta and gate projections (4 matvecs, 4 quantizations of the same 5120 floats).
+// On V100 a redundant quantize costs a full kernel launch, measured at ~2.6-3 us, plus a 20 kB
+// read and a 4.5 kB write.  Across the 64 layers of the test model that is ~200 redundant launches
+// per decoded token, i.e. ~0.6 ms of a ~29 ms token.
+//
+// The quantized copy lives in a private device buffer that is bump-allocated once per graph pass
+// and never freed (a captured graph holds pointers into it, so it must stay alive).  Entries are
+// keyed by the tensor object rather than by its data address: the graph allocator recycles
+// addresses, and two different tensors must never alias in this cache.
+//
+// The cache is only active between ggml_cuda_q8_1_cache_begin() and ..._end(), so code paths that
+// run outside of a graph node loop keep the upstream behaviour.  GGML_V100_MMVQ_Q8_1=0 disables it.
+// -----------------------------------------------------------------------------------------------
+
+static const size_t GGML_V100_Q8_1_CACHE_BYTES = (size_t) 64 << 20;
+
+struct ggml_v100_q8_1_cache {
+    bool   active  = false;  // inside a graph pass
+    bool   usable  = true;   // the device buffer could be allocated
+    char * buf     = nullptr;
+    size_t used    = 0;      // bytes handed out during the current pass
+    std::unordered_map<const ggml_tensor *, std::pair<char *, size_t>> entries;
+};
+
+static ggml_v100_q8_1_cache g_v100_q8_1_cache[GGML_CUDA_MAX_DEVICES];
+
+void ggml_cuda_q8_1_cache_begin(const int device) {
+    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES) {
+        return;
+    }
+    ggml_v100_q8_1_cache & c = g_v100_q8_1_cache[device];
+    c.entries.clear();
+    c.used   = 0;
+    c.active = true;
+}
+
+void ggml_cuda_q8_1_cache_end(const int device) {
+    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES) {
+        return;
+    }
+    g_v100_q8_1_cache[device].active = false;
+}
+
+// Looks up (or reserves) the cache slot that holds the q8_1 quantized copy of src1.
+//
+// On return:
+//   *ptr_out != nullptr, *needs_quantize == false  -> the slot already holds a valid copy, reuse it.
+//   *ptr_out != nullptr, *needs_quantize == true   -> freshly reserved slot, the caller must fill it.
+//   *ptr_out == nullptr                            -> cache unavailable (disabled, out of room or
+//                                                     src1 == nullptr), the caller uses its own
+//                                                     buffer and always quantizes.
+static char * ggml_cuda_q8_1_cache_get(const int device, cudaStream_t stream, const ggml_tensor * src1,
+        const size_t nbytes, bool * needs_quantize) {
+    *needs_quantize = true;
+    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES || src1 == nullptr) {
+        return nullptr;
+    }
+    ggml_v100_q8_1_cache & c = g_v100_q8_1_cache[device];
+    if (!c.active || !c.usable) {
+        return nullptr;
+    }
+
+    static const bool enabled = []() {
+        const char * env = getenv("GGML_V100_MMVQ_Q8_1");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    if (!enabled) {
+        return nullptr;
+    }
+
+    const auto it = c.entries.find(src1);
+    if (it != c.entries.end()) {
+        // Same tensor, same size: reuse.  A size mismatch means the caller asked for something
+        // unexpected, so fall through to a fresh quantization rather than serving wrong data.
+        if (it->second.second == nbytes) {
+            *needs_quantize = false;
+            return it->second.first;
+        }
+        return nullptr;
+    }
+
+    if (c.buf == nullptr) {
+        if (nbytes > GGML_V100_Q8_1_CACHE_BYTES) {
+            c.usable = false;
+            return nullptr;
+        }
+        // cudaMalloc is illegal while a stream is being captured. The first call for a given graph
+        // always runs directly (the CUDA graph warmup), so the buffer is normally allocated before
+        // any capture starts; this is just a guard so that a capture never fails.
+        cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+        if (cudaStreamIsCapturing(stream, &capture_status) == cudaSuccess &&
+            capture_status != cudaStreamCaptureStatusNone) {
+            return nullptr;
+        }
+        ggml_cuda_set_device(device);
+        if (cudaMalloc((void **) &c.buf, GGML_V100_Q8_1_CACHE_BYTES) != cudaSuccess) {
+            (void) cudaGetLastError();
+            c.buf    = nullptr;
+            c.usable = false;
+            return nullptr;
+        }
+    }
+    if (c.used + nbytes > GGML_V100_Q8_1_CACHE_BYTES) {
+        // Do not grow: an already captured graph may point into this buffer.
+        return nullptr;
+    }
+
+    char * const p = c.buf + c.used;
+    c.used += nbytes;
+    c.entries.emplace(src1, std::make_pair(p, nbytes));
+    return p; // *needs_quantize stays true: the caller fills this brand new slot
+}
+
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion) {
@@ -1468,6 +1695,11 @@ void ggml_cuda_mul_mat_vec_q(
         }
         fusion_local.glu_op = fusion->glu_op;
         fusion_local.glu_limit = fusion->glu_limit;
+        // EXPERIMENTAL (Codex, V100): the SSM alpha/beta epilogue lives in the device struct too,
+        // so it has to be copied over as well - forgetting this silently ran the default epilogue
+        // (raw matvec result) and produced garbage downstream.
+        fusion_local.ssm_a    = fusion->ssm_a ? fusion->ssm_a->data : nullptr;
+        fusion_local.epilogue = fusion->epilogue;
     }
 
     // If src0 is a temporary compute buffer, clear any potential padding.
@@ -1482,12 +1714,31 @@ void ggml_cuda_mul_mat_vec_q(
     }
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
-    {
+    const size_t src1_q8_1_bytes = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
+    // EXPERIMENTAL (Codex, V100): reuse the quantized activation if an earlier node in this graph
+    // pass already quantized the very same tensor.
+    bool needs_quantize = true;
+    char * src1_q8_1_ptr = ggml_cuda_q8_1_cache_get(ggml_cuda_get_device(), stream, src1, src1_q8_1_bytes, &needs_quantize);
+    ggml_cuda_pool_alloc<char> src1_q8_1;
+    if (src1_q8_1_ptr == nullptr) {
+        src1_q8_1.alloc(ctx.pool(), src1_q8_1_bytes);
+        src1_q8_1_ptr = src1_q8_1.get();
+        needs_quantize = true;
+    }
+    if (needs_quantize) {
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
-        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1_ptr, src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+    }
+    // DEBUG (Codex, V100): GGML_V100_MMVQ_Q8_1_DEBUG=1 traces every MMVQ activation quantization.
+    static const bool q8_1_cache_debug = getenv("GGML_V100_MMVQ_Q8_1_DEBUG") != nullptr;
+    if (q8_1_cache_debug) {
+        fprintf(stderr, "[q8cache] %-28s src1=%p ne=(%lld,%lld,%lld,%lld) nbytes=%zu %s buf=%p\n",
+                src1->name, (const void *) src1,
+                (long long) ne10, (long long) ne11, (long long) ne12, (long long) ne13,
+                src1_q8_1_bytes, needs_quantize ? "QUANTIZE" : "reuse",
+                (const void *) src1_q8_1_ptr);
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;
@@ -1513,7 +1764,7 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
     mul_mat_vec_q_switch_type(
-        src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
+        src0->data, src0->type, src1_q8_1_ptr, ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);

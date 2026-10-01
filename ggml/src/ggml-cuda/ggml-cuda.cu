@@ -3183,6 +3183,83 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         return std::equal(list1.begin(), list1.end(), list2.begin(), list2.end());
     };
 
+    // EXPERIMENTAL (Codex, V100): SSM projections of the hybrid models.
+    //   alpha: MUL_MAT -> RESHAPE -> ADD(+ssm_dt.bias) -> SOFTPLUS -> MUL(*ssm_a)
+    //   beta:  MUL_MAT -> RESHAPE -> SIGMOID
+    // Both collapse into a single MMVQ launch (see ggml_cuda_mm_fusion_args_host::epilogue).
+    // These get their own validation because the generic ggml_can_fuse() also requires every node
+    // to carry the COMPUTE flag and to have the same shape as its predecessor, which the RESHAPE
+    // views in between do not satisfy.
+    if (ops.size() == 5 && ops.begin()[0] == GGML_OP_MUL_MAT && ops.begin()[1] == GGML_OP_RESHAPE &&
+        ops.begin()[2] == GGML_OP_ADD && ops.begin()[3] == GGML_OP_UNARY && ops.begin()[4] == GGML_OP_MUL) {
+        if (node_idx + 5 > cgraph->n_nodes) {
+            return false;
+        }
+        const ggml_tensor * mm      = cgraph->nodes[node_idx];
+        const ggml_tensor * reshape = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * add     = cgraph->nodes[node_idx + 2];
+        const ggml_tensor * unary   = cgraph->nodes[node_idx + 3];
+        const ggml_tensor * mul     = cgraph->nodes[node_idx + 4];
+
+        // `ops` is only the requested pattern, so the actual nodes have to be checked here.
+        if (mm->op != GGML_OP_MUL_MAT || reshape->op != GGML_OP_RESHAPE || add->op != GGML_OP_ADD ||
+            unary->op != GGML_OP_UNARY || mul->op != GGML_OP_MUL) {
+            return false;
+        }
+        if (ggml_get_unary_op(unary) != GGML_UNARY_OP_SOFTPLUS) {
+            return false;
+        }
+        // a RESHAPE view links to its source through view_src
+        if ((reshape->src[0] != mm && reshape->view_src != mm) || unary->src[0] != add) {
+            return false;
+        }
+        const ggml_tensor * bias  = add->src[0] == reshape ? add->src[1] : (add->src[1] == reshape ? add->src[0] : nullptr);
+        const ggml_tensor * ssm_a = mul->src[0]  == unary   ? mul->src[1]   : (mul->src[1]  == unary   ? mul->src[0]   : nullptr);
+        if (bias == nullptr || ssm_a == nullptr) {
+            return false;
+        }
+        if (bias->type != GGML_TYPE_F32 || ssm_a->type != GGML_TYPE_F32 ||
+            mm->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32) {
+            return false;
+        }
+        // the epilogue applies both per output row, so they must have the row count of the output
+        if (bias->ne[0] != mul->ne[0] || ssm_a->ne[0] != mul->ne[0]) {
+            return false;
+        }
+        // everything except the last node is elided, so its uses must stay inside this subgraph
+        {
+            int out_nodes[] = { node_idx + 4 };
+            return ggml_can_fuse_subgraph(cgraph, node_idx, 5, ops.begin(), out_nodes, 1);
+        }
+    }
+
+    if (ops.size() == 3 && ops.begin()[0] == GGML_OP_MUL_MAT && ops.begin()[1] == GGML_OP_RESHAPE &&
+        ops.begin()[2] == GGML_OP_UNARY) {
+        if (node_idx + 3 > cgraph->n_nodes) {
+            return false;
+        }
+        const ggml_tensor * mm      = cgraph->nodes[node_idx];
+        const ggml_tensor * reshape = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * unary   = cgraph->nodes[node_idx + 2];
+
+        if (mm->op != GGML_OP_MUL_MAT || reshape->op != GGML_OP_RESHAPE || unary->op != GGML_OP_UNARY) {
+            return false;
+        }
+        if (ggml_get_unary_op(unary) != GGML_UNARY_OP_SIGMOID) {
+            return false;
+        }
+        if ((reshape->src[0] != mm && reshape->view_src != mm) || unary->src[0] != reshape) {
+            return false;
+        }
+        if (mm->type != GGML_TYPE_F32 || unary->type != GGML_TYPE_F32) {
+            return false;
+        }
+        {
+            int out_nodes[] = { node_idx + 2 };
+            return ggml_can_fuse_subgraph(cgraph, node_idx, 3, ops.begin(), out_nodes, 1);
+        }
+    }
+
     std::initializer_list<enum ggml_op> mul_mat_bias_glu_ops    = { GGML_OP_MUL_MAT,    GGML_OP_ADD,    GGML_OP_MUL_MAT,    GGML_OP_ADD,    GGML_OP_GLU };
     std::initializer_list<enum ggml_op> mul_mat_id_bias_glu_ops = { GGML_OP_MUL_MAT_ID, GGML_OP_ADD_ID, GGML_OP_MUL_MAT_ID, GGML_OP_ADD_ID, GGML_OP_GLU };
 
@@ -3260,6 +3337,32 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 
     if (!ggml_can_fuse(cgraph, node_idx, ops)) {
         return false;
+    }
+
+    // EXPERIMENTAL (Codex, V100): fold the constant scale that the hybrid SSM layers apply to their
+    // q/k conv norms into the norm kernel itself (one launch instead of two).
+    if (ops.size() == 2 && ops.begin()[0] == GGML_OP_RMS_NORM && ops.begin()[1] == GGML_OP_SCALE) {
+        const ggml_tensor * rms_norm = cgraph->nodes[node_idx];
+        const ggml_tensor * scale    = cgraph->nodes[node_idx + 1];
+
+        // GGML_V100_RMS_SCALE=0 restores the unfused behaviour (one extra kernel per norm).
+        static const bool enabled = []() {
+            const char * env = getenv("GGML_V100_RMS_SCALE");
+            return env == nullptr || atoi(env) != 0;
+        }();
+        if (!enabled) {
+            return false;
+        }
+        if (rms_norm->src[0]->type != GGML_TYPE_F32 || rms_norm->type != GGML_TYPE_F32 || scale->type != GGML_TYPE_F32) {
+            return false;
+        }
+        // The fused kernel writes the scale node's buffer as a plain contiguous copy of the norm
+        // output, so only that layout is supported.
+        if (scale->src[0] != rms_norm || !ggml_are_same_shape(rms_norm, scale) ||
+            !ggml_is_contiguous(scale) || !ggml_is_contiguous_rows(rms_norm->src[0])) {
+            return false;
+        }
+        return true;
     }
 
     if ((ops.size() == 2 || ops.size() == 3) && ops.begin()[0] == GGML_OP_RMS_NORM && ops.begin()[1] == GGML_OP_MUL) {
@@ -3429,6 +3532,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    // DEBUG (Codex, V100): show the op window the pattern matcher sees around every MUL_MAT.
+    static const bool ssm_debug = getenv("GGML_V100_SSM_DEBUG") != nullptr;
+    if (ssm_debug && node->op == GGML_OP_MUL_MAT && i + 4 < cgraph->n_nodes &&
+        cgraph->nodes[i + 1]->op == GGML_OP_RESHAPE) {
+        fprintf(stderr, "[v100-ssm] window at %d (%s): %s %s %s %s %s\n", i, node->name,
+                ggml_op_name(cgraph->nodes[i + 0]->op), ggml_op_name(cgraph->nodes[i + 1]->op),
+                ggml_op_name(cgraph->nodes[i + 2]->op), ggml_op_name(cgraph->nodes[i + 3]->op),
+                ggml_op_name(cgraph->nodes[i + 4]->op));
+    }
 
     if (node->op == GGML_OP_MUL) {
         ggml_cuda_moe_weighted_reduction_match match;
@@ -4124,6 +4237,68 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return fused_node_count - 1;
     }
 
+    // EXPERIMENTAL (Codex, V100): SSM alpha projection in a single MMVQ launch
+    // (MUL_MAT -> RESHAPE -> +bias -> softplus -> *ssm_a).
+    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL },
+                           { GGML_UNARY_OP_SOFTPLUS })) {
+        ggml_tensor * mm    = cgraph->nodes[i];
+        ggml_tensor * add   = cgraph->nodes[i + 2];
+        ggml_tensor * unary = cgraph->nodes[i + 3];
+        ggml_tensor * mul   = cgraph->nodes[i + 4];
+        ggml_tensor * bias  = add->src[0] == cgraph->nodes[i + 1] ? add->src[1] : add->src[0];
+        ggml_tensor * ssm_a = mul->src[0] == unary                ? mul->src[1] : mul->src[0];
+
+        // FIXED (2026-09-21): the earlier garbage output came from mmvq.cu not copying
+        // ssm_a/epilogue into the device-side fusion struct, so the kernel ran the default
+        // epilogue. That is fixed, and the fused path is correct and coherent now - but measured
+        // only +0.3% (35.01 vs ~34.95 t/s at d=0), i.e. inside the noise, while it also loses the
+        // bit-identical property the other patches have. Default OFF, enable with GGML_V100_SSM=1.
+        static const bool v100_ssm_fusion = []() {
+            const char * env = getenv("GGML_V100_SSM");
+            return env != nullptr && atoi(env) != 0;
+        }();
+        if (v100_ssm_fusion && ggml_cuda_should_fuse_mul_mat_vec_q(mm)) {
+            ggml_cuda_mm_fusion_args_host fusion_data{};
+            fusion_data.x_bias   = bias;
+            fusion_data.ssm_a    = ssm_a;
+            fusion_data.epilogue = 1;
+            if (getenv("GGML_V100_SSM_DEBUG")) {
+                fprintf(stderr, "[v100-ssm] fused alpha at node %d: %s + %s -> %s\n", i, mm->name, bias->name, mul->name);
+            }
+            ggml_cuda_mul_mat_vec_q(*cuda_ctx, mm->src[0], mm->src[1], mm->src[2], mul, &fusion_data);
+            return 4;
+        }
+    }
+
+    // EXPERIMENTAL (Codex, V100): SSM beta projection in a single MMVQ launch (MUL_MAT -> sigmoid).
+    // DISABLED: the SIGMOID output is shaped (1, n) because the RESHAPE in between transposes it, and
+    // ggml_cuda_mul_mat_vec_q requires the dst of a fused matvec to have ne[1] == 1. Fusing it would
+    // need a descriptor with the pre-reshape shape pointing at the same memory; not worth the risk
+    // for one launch per layer.
+    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_UNARY },
+                           { GGML_UNARY_OP_SIGMOID })) {
+        ggml_tensor * mm    = cgraph->nodes[i];
+        ggml_tensor * unary = cgraph->nodes[i + 2];
+
+        GGML_UNUSED(mm);
+        GGML_UNUSED(unary);
+        if (false) {
+            ggml_cuda_mm_fusion_args_host fusion_data{};
+            fusion_data.epilogue = 2;
+            if (getenv("GGML_V100_SSM_DEBUG")) {
+                fprintf(stderr, "[v100-ssm] fused beta at node %d: %s -> %s\n", i, mm->name, unary->name);
+            }
+            ggml_cuda_mul_mat_vec_q(*cuda_ctx, mm->src[0], mm->src[1], mm->src[2], unary, &fusion_data);
+            return 2;
+        }
+    }
+
+    // EXPERIMENTAL (Codex, V100): rms_norm + constant scale in one kernel.
+    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_SCALE }, {})) {
+        ggml_cuda_op_rms_norm_scale_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        return 1;
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
         ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 4]);
         return 4;
@@ -4272,6 +4447,21 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 stream_ctx.concurrent_events.clear();
             }
 
+            // EXPERIMENTAL (Codex, V100): start a fresh q8_1 activation cache for this graph pass.
+            ggml_cuda_q8_1_cache_begin(cuda_ctx->device);
+
+            // DEBUG (Codex, V100): GGML_V100_DUMP_NODES=1 prints the node list this backend sees,
+            // which is what ggml_cuda_try_fuse matches its patterns against.
+            static const bool dump_nodes = getenv("GGML_V100_DUMP_NODES") != nullptr;
+            if (dump_nodes) {
+                for (int i = 0; i < cgraph->n_nodes; i++) {
+                    const ggml_tensor * n = cgraph->nodes[i];
+                    fprintf(stderr, "[cuda-node] %4d %-14s %-28s ne=(%lld,%lld,%lld,%lld)\n",
+                            i, ggml_op_name(n->op), n->name,
+                            (long long) n->ne[0], (long long) n->ne[1], (long long) n->ne[2], (long long) n->ne[3]);
+                }
+            }
+
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (is_concurrent_event_active) {
@@ -4353,6 +4543,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     try_launch_concurrent_event(node);
                }
             }
+
+            // EXPERIMENTAL (Codex, V100): the q8_1 cache is only valid inside one node loop.
+            ggml_cuda_q8_1_cache_end(cuda_ctx->device);
         }
 
 #ifdef USE_CUDA_GRAPH

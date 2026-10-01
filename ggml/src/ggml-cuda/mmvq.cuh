@@ -11,6 +11,12 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc);
 void ggml_cuda_mul_mat_vec_q(ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion = nullptr);
 
+// EXPERIMENTAL (Codex, V100): per-graph cache that lets several MMVQ nodes share the q8_1
+// quantization of the same activation tensor. See the comment in mmvq.cu. The caller brackets one
+// graph pass (a full node loop) with begin/end; outside of that the cache is inactive.
+void ggml_cuda_q8_1_cache_begin(int device);
+void ggml_cuda_q8_1_cache_end  (int device);
+
 void ggml_cuda_op_mul_mat_vec_q(
     ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,

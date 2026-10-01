@@ -933,6 +933,9 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
     // iqs = 12..15 -> bq8_offset = 6, want q4_offset = 96, 100, 104, 108
 
     const int * q4 = (const int *)(bq4_K->qs + 16 * bq8_offset + 4 * ((iqs/2)%4));
+    // EXPERIMENTAL (Codex, V100): tried __ldcs here to stop the streamed weights from evicting the
+    // activation from L2. It regressed (33.18 vs 34.23 t/s at d=0) because .cs applies to L1 as well,
+    // and this kernel relies on an 83% L1 hit rate. Volta has no L2-only cache policy instruction.
     v[0] = q4[0];
     v[1] = q4[4];
 

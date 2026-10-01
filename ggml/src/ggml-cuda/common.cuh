@@ -1574,6 +1574,10 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * gate_scale = nullptr;
     ggml_glu_op glu_op;
     float glu_limit = 0.0f;
+    // EXPERIMENTAL (Codex, V100): epilogue for the SSM alpha/beta projections of the hybrid models,
+    // so that "matvec -> +bias -> softplus -> *ssm_a" and "matvec -> sigmoid" stay single kernels.
+    const ggml_tensor * ssm_a    = nullptr;
+    int                 epilogue = 0; // 0 = upstream behaviour, 1 = softplus(x+bias)*ssm_a, 2 = sigmoid(x)
 };
 struct ggml_cuda_mm_fusion_args_device {
     const void * x_bias = nullptr;
@@ -1583,6 +1587,8 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * gate_scale = nullptr;
     ggml_glu_op glu_op;
     float glu_limit = 0.0f;
+    const void * ssm_a    = nullptr;
+    int          epilogue = 0;
 };
 
 struct ggml_cuda_kernel_launch_params {

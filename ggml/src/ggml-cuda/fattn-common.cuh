@@ -5,6 +5,15 @@
 #include "vecdotq.cuh"
 
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+
+// EXPERIMENTAL (Codex, V100 investigation): set GGML_V100_FA_DEBUG=1 to print the chosen
+// FlashAttention launch configuration once per distinct configuration.
+static inline bool ggml_cuda_fattn_debug() {
+    static const bool enabled = getenv("GGML_V100_FA_DEBUG") != nullptr;
+    return enabled;
+}
 
 #define FATTN_KQ_STRIDE       256
 #define HALF_MAX_HALF         __float2half(65504.0f/2) // Use neg. of this instead of -INFINITY to initialize KQ max vals to avoid NaN upon subtraction.
@@ -1167,12 +1176,23 @@ void launch_fattn(
         // parallel_blocks must not be larger than what the tensor size allows:
         parallel_blocks = std::min(parallel_blocks, ntiles_KV);
 
+        // EXPERIMENTAL (Codex, V100 investigation): GGML_V100_FA_SPLIT=<n> forces the number of
+        // KV splits per output tile and disables the heuristic search below. 0 = keep the default.
+        bool parallel_blocks_forced = false;
+        if (const char * env_split = getenv("GGML_V100_FA_SPLIT")) {
+            const int v = atoi(env_split);
+            if (v > 0) {
+                parallel_blocks = std::min(v, ntiles_KV);
+            }
+            parallel_blocks_forced = true;
+        }
+
         // If ntiles_total % blocks_per_wave != 0 then some efficiency is lost due to tail effects.
         // Test whether parallel_blocks can be set to a higher value for better efficiency.
         const int blocks_per_wave = nsm * max_blocks_per_sm;
         int nwaves_best = 0;
         int efficiency_percent_best = 0;
-        for (int parallel_blocks_test = parallel_blocks; parallel_blocks_test <= ntiles_KV; ++parallel_blocks_test) {
+        for (int parallel_blocks_test = parallel_blocks; !parallel_blocks_forced && parallel_blocks_test <= ntiles_KV; ++parallel_blocks_test) {
             const int nblocks_total = ntiles_dst * parallel_blocks_test;
             const int nwaves = (nblocks_total + blocks_per_wave - 1) / blocks_per_wave;
             const int efficiency_percent = 100 * nblocks_total / (nwaves*blocks_per_wave);
@@ -1196,6 +1216,22 @@ void launch_fattn(
         if (parallel_blocks > 1) {
             dst_tmp.alloc(parallel_blocks*ggml_nelements(KQV));
             dst_tmp_meta.alloc(parallel_blocks*ggml_nrows(KQV));
+        }
+    }
+
+    if (ggml_cuda_fattn_debug()) {
+        static int64_t last_n_kv = -1;
+        static int last_bx = -1, last_by = -1, last_bz = -1, last_pb = -1;
+        if (last_n_kv != n_kv || last_bx != (int) blocks_num.x || last_by != (int) blocks_num.y ||
+            last_bz != (int) blocks_num.z || last_pb != parallel_blocks) {
+            last_n_kv = n_kv; last_bx = blocks_num.x; last_by = blocks_num.y; last_bz = blocks_num.z; last_pb = parallel_blocks;
+            fprintf(stderr,
+                "[v100-fa] n_kv=%lld ncols1=%d ncols2=%d ntiles_x=%d ntiles_z_gqa=%d ntiles_dst=%d nbatch_fa=%d "
+                "ntiles_KV=%d max_blocks_per_sm=%d nsm=%d parallel_blocks=%d blocks=(%u,%u,%u) stream_k=%d "
+                "need_f16_K=%d need_f16_V=%d\n",
+                (long long) n_kv, ncols1, ncols2, ntiles_x, ntiles_z_gqa, ntiles_dst, nbatch_fa, ntiles_KV,
+                max_blocks_per_sm, nsm, parallel_blocks, blocks_num.x, blocks_num.y, blocks_num.z,
+                (int) stream_k, (int) need_f16_K, (int) need_f16_V);
         }
     }
 

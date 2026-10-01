@@ -5,6 +5,8 @@
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
 
+#include <cstring>
+
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 __launch_bounds__(256, 1)
 static __global__ void flash_attn_mask_to_sparse_indices(
@@ -157,7 +159,16 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
         }
     }
 
-    if (Q->ne[1] <= 32/ncols2 || (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_TURING) ||
+    // EXPERIMENTAL (Codex, V100): GGML_V100_FA_MMA_NCOLS1=16 forces a 16 query column tile
+    // (ncols == 32 when ncols2 == 2). Halving the tile halves the Q registers and the K/V shared
+    // memory tile, which raises the occupancy that the ncu profile showed to be the limiting factor.
+    static const bool force_ncols1_16 = []() {
+        const char * env = getenv("GGML_V100_FA_MMA_NCOLS1");
+        return env != nullptr && atoi(env) == 16;
+    }();
+
+    if (Q->ne[1] <= 32/ncols2 || force_ncols1_16 ||
+            (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_TURING) ||
             (GGML_CUDA_CC_IS_AMD(cc) && DKQ > 256)) {
         ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 32/ncols2, ncols2>(ctx, dst);
         return;
@@ -496,6 +507,37 @@ static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
     }
 }
 
+// EXPERIMENTAL (Codex, V100): the tile kernel can read the K/V cache directly, without converting it
+// to FP16 first, for these type/size combinations. Must stay in sync with the template
+// instantiations in fattn-tile.cuh (see ggml_cuda_flash_attn_ext_tile_case).
+// For q8_0 the tile kernel is only a win when it can dequantize the K/V of a whole GQA group in a
+// single tile, which is implemented for a GQA ratio that is a multiple of 6 (24 query / 4 KV heads).
+static bool ggml_cuda_fattn_tile_direct_kv(const ggml_tensor * Q, const ggml_tensor * K, const ggml_tensor * V) {
+    // GGML_V100_FA_DIRECT=0 restores the upstream behavior (convert K/V to FP16 first) for A/B tests.
+    static const bool disabled = []() {
+        const char * env = getenv("GGML_V100_FA_DIRECT");
+        return env != nullptr && atoi(env) == 0;
+    }();
+    if (disabled) {
+        return false;
+    }
+    if (K->type != V->type) {
+        return false;
+    }
+    if (K->type == GGML_TYPE_F16) {
+        return true;
+    }
+    // TEMPORARY (upstream comparison build): do not use the direct q8_0 path.
+    if (getenv("GGML_V100_UPSTREAM_BUILD") != nullptr) {
+        return false;
+    }
+    if (K->type != GGML_TYPE_Q8_0 || Q->ne[0] != 256) {
+        return false;
+    }
+    const int gqa_ratio = Q->ne[2] / K->ne[2];
+    return gqa_ratio % 6 == 0;
+}
+
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
 #ifndef FLASH_ATTN_AVAILABLE
     GGML_UNUSED(device); GGML_UNUSED(dst);
@@ -592,6 +634,20 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
+    // EXPERIMENTAL (Codex, V100 investigation): GGML_V100_FA=vec|tile|mma forces a specific kernel
+    // so that the dispatch heuristics can be measured. Anything else (or unset) keeps the default.
+    if (const char * env_fa = getenv("GGML_V100_FA")) {
+        if (strcmp(env_fa, "vec") == 0 && can_use_vector_kernel) {
+            return BEST_FATTN_KERNEL_VEC;
+        }
+        if (strcmp(env_fa, "tile") == 0) {
+            return BEST_FATTN_KERNEL_TILE;
+        }
+        if (strcmp(env_fa, "mma") == 0) {
+            return BEST_FATTN_KERNEL_MMA_F16;
+        }
+    }
+
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
         if (can_use_vector_kernel) {
@@ -624,7 +680,12 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     if (volta_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
-        if (can_use_vector_kernel && Q->ne[1] * gqa_ratio_eff <= 2) {
+        // EXPERIMENTAL (Codex, V100): prefer the tile kernel for small batch sizes when it can read
+        // the K/V cache directly: the vector kernel re-reads and re-dequantizes the same K/V for
+        // every query head (12.5% occupancy, ~160 GB/s), while the tile kernel stages K/V through
+        // shared memory (~460 GB/s). Set GGML_V100_FA=vec to get the old behavior back.
+        const bool tile_direct_kv = ggml_cuda_fattn_tile_direct_kv(Q, K, V);
+        if (can_use_vector_kernel && !tile_direct_kv && Q->ne[1] * gqa_ratio_eff <= 2) {
             return BEST_FATTN_KERNEL_VEC;
         }
         if (Q->ne[1] * gqa_ratio_eff <= 16) {
@@ -688,6 +749,13 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
         case BEST_FATTN_KERNEL_MMA_F16:
             need_f16_K = true;
             need_f16_V = true;
+            // EXPERIMENTAL (Codex, V100): the tile kernel reads K/V directly when there is a matching
+            // template instantiation, so the conversion pass must not be accounted for.
+            if (kernel == BEST_FATTN_KERNEL_TILE &&
+                ggml_cuda_fattn_tile_direct_kv(Q, K, V)) {
+                need_f16_K = false;
+                need_f16_V = false;
+            }
             break;
         case BEST_FATTN_KERNEL_VEC: {
             const bool f16_fallback = ggml_cuda_get_fattn_vec_case(Q->ne[0], K->type, V->type) == nullptr;
@@ -706,7 +774,31 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
-    switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
+    const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst);
+    if (ggml_cuda_fattn_debug()) {
+        static int last_kernel = -1;
+        if (last_kernel != (int) kernel) {
+            last_kernel = (int) kernel;
+            const char * name = kernel == BEST_FATTN_KERNEL_VEC     ? "VEC" :
+                                kernel == BEST_FATTN_KERNEL_TILE    ? "TILE" :
+                                kernel == BEST_FATTN_KERNEL_MMA_F16 ? "MMA_F16" : "NONE";
+            fprintf(stderr, "[v100-fa] chosen kernel = %s\n", name);
+        }
+        static int64_t last_shape = -1;
+        const ggml_tensor * Kg = dst->src[1];
+        const ggml_tensor * Vg = dst->src[2];
+        if (last_shape != (int64_t) Kg->ne[1]) {
+            last_shape = (int64_t) Kg->ne[1];
+            fprintf(stderr,
+                "[v100-fa] K type=%d ne=(%lld,%lld,%lld,%lld) nb=(%lld,%lld,%lld,%lld) | "
+                "V type=%d ne=(%lld,%lld,%lld,%lld) nb=(%lld,%lld,%lld,%lld)\n",
+                (int) Kg->type, (long long) Kg->ne[0], (long long) Kg->ne[1], (long long) Kg->ne[2], (long long) Kg->ne[3],
+                (long long) Kg->nb[0], (long long) Kg->nb[1], (long long) Kg->nb[2], (long long) Kg->nb[3],
+                (int) Vg->type, (long long) Vg->ne[0], (long long) Vg->ne[1], (long long) Vg->ne[2], (long long) Vg->ne[3],
+                (long long) Vg->nb[0], (long long) Vg->nb[1], (long long) Vg->nb[2], (long long) Vg->nb[3]);
+        }
+    }
+    switch (kernel) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
         case BEST_FATTN_KERNEL_TILE:
